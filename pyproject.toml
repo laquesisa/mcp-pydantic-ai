@@ -1,5 +1,5 @@
 [project]
-name = "genai"
+name = "mcp-pydantic-ai"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
