@@ -1,5 +1,5 @@
 .env
 .venv
-.ruffcache
 __pycache__
 .DS_Store
+.ruff_cache
