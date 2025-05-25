@@ -20,31 +20,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+PROVIDERS = Literal["LOCAL", "GEMINI"]
 
-def get_llm_endpoint(provider: Literal["LOCAL", "GEMINI"] = "LOCAL"):
+def get_llm_endpoint(provider: PROVIDERS):
     """Returns the complete LLM API endpoint URL"""
-    base_url = os.getenv(f"LLM_BASE_URL_{provider}", "")
-    return base_url
+    return os.getenv(f"LLM_BASE_URL_{provider}", "")
 
 
-def get_model_name(provider: Literal["LOCAL", "GEMINI"] = "LOCAL"):
+def get_model_name(provider: PROVIDERS):
     """Returns the model name to use for API requests"""
     return os.getenv(f"LLM_MODEL_NAME_{provider}", "")
 
 
-def get_llm_api_key(provider: Literal["LOCAL", "GEMINI"] = "LOCAL"):
-    """Returns the llm api keyto use for API requests"""
+def get_llm_api_key(provider: PROVIDERS):
+    """Returns the llm api key to use for API requests"""
     return os.getenv(f"LLM_API_KEY_{provider}", "")
 
 
 class MCPClient:
-    def __init__(self):
+    def __init__(self, provider: PROVIDERS):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         self.state: list[ModelMessage] = []
         self.tools: list[MCPServerStdio] = []
         self.agent: Optional[Agent] = None
+        self.setup_agent(provider=provider)
 
     async def connect_to_server(self):
         # setup MCP servers
@@ -71,75 +72,75 @@ class MCPClient:
             command="npx",
             args=["-y", "@modelcontextprotocol/server-everything"],
         )
-        self.tools.extend([weather, obsidian, filesystem, everything])
+        self.tools.extend([weather, obsidian])
 
-    def setup_agent(self):
-        # Create nodes for different agents
-        model_local = OpenAIModel(
-            model_name=get_model_name("LOCAL"),
-            provider=OpenAIProvider(
-                base_url=get_llm_endpoint("LOCAL"),
-                api_key=get_llm_api_key("LOCAL"),
-            ),
-        )
-        _ = Agent(
-            model_local,
-            mcp_servers=self.tools,
-            output_type=str,
-            model_settings={
-                "frequency_penalty": 8.0,
-                "temperature": 0.1,
-            },
-            end_strategy="early",
-            system_prompt=(
-                "If the question is not related to the mcp servers, answer it using your own knowledge. "
-                "If the question is related to the mcp servers, use the functions to answer it. "
-                "Use the answers from the mcp servers to answer the user's question. "
-                "If 'isError' is False for the tool response, use the content from the tool response to provide an answer to the user. "
-                "You get answers from the mcp servers. Use the answers from the mcp servers to answer the user's question. "
-                "Provide a long answer at the end."
-            ),
-            instrument=True,
-        )
+    def setup_agent(self, provider: PROVIDERS):
+        if provider == "LOCAL":
+            # Create nodes for different agents
+            model = OpenAIModel(
+                model_name=get_model_name("LOCAL"),
+                provider=OpenAIProvider(
+                    base_url=get_llm_endpoint("LOCAL"),
+                    api_key=get_llm_api_key("LOCAL"),
+                ),
+            )
+            
+            agent = Agent(
+                model,
+                mcp_servers=self.tools,
+                output_type=str,
+                model_settings={
+                    "frequency_penalty": 2,
+                    "temperature": 0.1,
+                },
+                end_strategy="early",
+                system_prompt=(
+                    "If the question is not related to the mcp servers, answer it using your own knowledge. "
+                    "If the question is related to the mcp servers, use the functions to answer it. "
+                    "Use the answers from the mcp servers to answer it. "
+                    "If 'isError' is False for the tool response, use the content from the tool response to provide an answer to the user. "
+                    "You get answers from the mcp servers. Use the answers from the mcp servers to answer the user's question. "
+                    "Provide a long answer at the end."
+                ),
+                instrument=True,
+            )
+        elif provider == "GEMINI":
+            model = GeminiModel(
+                model_name=get_model_name("GEMINI"),
+                provider=GoogleGLAProvider(
+                    api_key=get_llm_api_key("GEMINI"),
+                ),
+            )
 
-        model_gemini = GeminiModel(
-            model_name=get_model_name("GEMINI"),
-            provider=GoogleGLAProvider(
-                api_key=get_llm_api_key("GEMINI"),
-            ),
-        )
+            agent = Agent(
+                model,
+                mcp_servers=self.tools,
+                output_type=str,
+                instrument=True,
+                system_prompt=(
+                    "Be a helpful assistant. "
+                    "Focus mostly on the last user's question."
+                    "If the question is not related to the mcp servers, answer it using your own knowledge. "
+                    "If the question is related to the mcp servers, use the functions to answer it. "
+                    "If someone asks you about the weather forecast of a city, figure out the latidude and longitude of the city yourself. "
+                ),
+            )
 
-        agent_gemini = Agent(
-            model_gemini,
-            mcp_servers=self.tools,
-            output_type=str,
-            instrument=True,
-            system_prompt=(
-                "Be a helpful assistant. "
-                "Focus mostly on the last user's question."
-                "If the question is not related to the mcp servers, answer it using your own knowledge. "
-                "If the question is related to the mcp servers, use the functions to answer it. "
-                "If someone asks you about the weather forecast of a city, figure out the latidude and longitude of the city yourself. "
-            ),
-        )
-
-        self.agent = agent_gemini
+        self.agent = agent
 
     async def process_query(self, user_message: str) -> str:
-        self.setup_agent()
-
         if not self.agent:
             raise RuntimeError("Agent not initialized")
 
         async with self.agent.run_mcp_servers():
             try:
-                async with self.agent.run_stream(
+                result = await self.agent.run(
                     user_message,
                     message_history=self.state,
                     usage_limits=UsageLimits(request_limit=15),
-                ) as result:
-                    self.state = result.all_messages()
-                    return await result.get_output()
+                )
+                self.state = result.all_messages()
+                return result.output
             except Exception as e:
                 print(f"Error: {e}")
                 return ""
@@ -153,7 +154,7 @@ class MCPClient:
             try:
                 query = input("\nQuery: ").strip()
 
-                if query.lower() == "quit":
+                if query.lower() == "quit" or query.lower() == "exit":
                     break
 
                 response = await self.process_query(query)
@@ -168,7 +169,7 @@ class MCPClient:
 
 
 async def main():
-    client = MCPClient()
+    client = MCPClient(provider="GEMINI")
     try:
         await client.connect_to_server()
         await client.chat_loop()
